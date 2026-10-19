@@ -2,12 +2,43 @@
 Agent-Based Model for Variable Rate Nitrogen Application (VRNA) Technology Adoption
 Based on FARMIND framework with Cumulative Prospect Theory (CPT)
 Author: Implementation for Zahra Pezeshkian's research
+
+REVISED VERSION - aligned with the manuscript and ODD (Appendix A).
+Changes relative to the original model.py are marked "CHANGE 1/2/3":
+
+  CHANGE 1  Annual input-price projection. Nitrogen price and operating costs grow
+            each year at fixed rates, so realised gross margins in a given
+            environment state differ between years (manuscript Section 3.4).
+            Stage 2 evaluates incremental payoffs at the current year's N price.
+  CHANGE 2  Stage 1 decision weights follow manuscript Eq. (4): remembered gross
+            margins are assumed to be normally distributed, and decision weights are
+            differences in weighted decumulative probabilities of that normal
+            distribution (FARMIND, Huber et al., 2022, 2023).
+  CHANGE 3  An agent is satisfied (repetition) if PV >= 0, as stated in the
+            manuscript (original code used PV > 0).
+
+Unchanged on purpose: the profit-maximisation benchmark (state-specific comparison)
+and the area-based payment (payment x farm_size_ha).
 """
 
+import math
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
+
+
+# ---------------------------------------------------------------------------
+# CHANGE 1: input-price parameters (base year = year in which the input-file
+# gross margins were computed). FILL IN the values from manuscript Table 5.
+# ---------------------------------------------------------------------------
+DEFAULT_PRICE_PARAMS = {
+    "n_uniform_kg_ha": 109.0,   # uniform N rate under baseline management (kg N/ha)
+    "n_price_base": None,       # base-year nitrogen price (CAD per kg N)      <-- FILL IN
+    "n_price_growth": None,     # annual growth rate of N price (e.g., 0.02)   <-- FILL IN
+    "opcost_base": None,        # base-year operating cost (CAD per ha)        <-- FILL IN
+    "opcost_growth": None,      # annual growth rate of operating costs        <-- FILL IN
+}
 
 
 @dataclass
@@ -21,16 +52,16 @@ class FarmerAgent:
     gamma_gain: float  # Probability weighting for gains
     gamma_loss: float  # Probability weighting for losses
     vref: float  # Reference gross margin
-    gm_vrna: np.ndarray  # Gross margins under VRNA for 60 states
-    gm_baseline: np.ndarray  # Gross margins under baseline for 60 states
-    benefit: np.ndarray  # Pre-computed Δπ = GM_VRNA - GM_Baseline
-    nred: np.ndarray  # Nitrogen reduction for 60 states
-    
+    gm_vrna: np.ndarray  # Gross margins under VRNA for 60 states (base-year prices)
+    gm_baseline: np.ndarray  # Gross margins under baseline for 60 states (base-year prices)
+    benefit: np.ndarray  # Pre-computed Δπ = GM_VRNA - GM_Baseline (base-year prices)
+    nred: np.ndarray  # Nitrogen reduction for 60 states (kg)
+
     # Dynamic state variables
     adopted: bool = False  # Current adoption status
-    memory_gm: List[float] = field(default_factory=list)  # Past 5 years of realized GMs
+    memory_gm: List[float] = field(default_factory=list)  # Past realized GMs
     adoption_history: List[int] = field(default_factory=list)  # Adoption status per year
-    
+
     def __post_init__(self):
         self.memory_gm = []
         self.adoption_history = []
@@ -38,102 +69,119 @@ class FarmerAgent:
 
 class CPTCalculator:
     """Implements Cumulative Prospect Theory calculations."""
-    
+
     @staticmethod
     def value_function(x: float, alpha: float, beta: float, lambda_param: float) -> float:
-        """
-        CPT value function.
-        v(x) = x^α if x >= 0
-        v(x) = -λ|x|^β if x < 0
-        """
+        """v(x) = x^α if x >= 0;  v(x) = -λ|x|^β if x < 0"""
         if x >= 0:
             return np.power(x, alpha)
         else:
             return -lambda_param * np.power(np.abs(x), beta)
-    
+
     @staticmethod
     def probability_weight(p: float, gamma: float) -> float:
-        """
-        CPT probability weighting function.
-        w(p) = p^γ / (p^γ + (1-p)^γ)^(1/γ)
-        """
+        """w(p) = p^γ / (p^γ + (1-p)^γ)^(1/γ)   (Wu and Gonzalez, 1996)"""
         if p <= 0:
             return 0.0
         if p >= 1:
             return 1.0
         if gamma <= 0:
             gamma = 0.01  # Avoid division issues
-        
         p_gamma = np.power(p, gamma)
         one_minus_p_gamma = np.power(1 - p, gamma)
         denominator = np.power(p_gamma + one_minus_p_gamma, 1 / gamma)
-        
         if denominator == 0:
             return 0.0
         return p_gamma / denominator
-    
+
     @staticmethod
     def compute_decision_weights(outcomes: np.ndarray, gamma_gain: float, gamma_loss: float) -> np.ndarray:
         """
-        Compute CPT decision weights for ranked outcomes.
-        Uses cumulative probability weighting procedure.
+        Rank-dependent CPT decision weights with equal objective probabilities
+        (used in Stage 2, over the 60 environment states). Unchanged.
         """
         n = len(outcomes)
         weights = np.zeros(n)
-        
-        # Sort outcomes and get indices
         sorted_indices = np.argsort(outcomes)
         sorted_outcomes = outcomes[sorted_indices]
-        
-        # Equal objective probabilities
-        p = 1.0 / n
-        
         for i, idx in enumerate(sorted_indices):
             outcome = sorted_outcomes[i]
-            
-            # Cumulative probability up to this outcome
             cumulative_prob = (i + 1) / n
             prev_cumulative_prob = i / n
-            
             if outcome >= 0:
-                # For gains: w(P(X >= x)) - w(P(X > x))
-                # which is w(1 - F(x-)) - w(1 - F(x))
                 w_current = CPTCalculator.probability_weight(1 - prev_cumulative_prob, gamma_gain)
                 w_next = CPTCalculator.probability_weight(1 - cumulative_prob, gamma_gain)
                 weights[idx] = w_current - w_next
             else:
-                # For losses: w(F(x)) - w(F(x-))
                 w_current = CPTCalculator.probability_weight(cumulative_prob, gamma_loss)
                 w_prev = CPTCalculator.probability_weight(prev_cumulative_prob, gamma_loss)
                 weights[idx] = w_current - w_prev
-        
         return weights
-    
+
+    # ------------------------------------------------------------------
+    # CHANGE 2: Stage 1 decision weights based on a normal distribution
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normal_cdf(x: float, mu: float, sd: float) -> float:
+        if x == math.inf:
+            return 1.0
+        if x == -math.inf:
+            return 0.0
+        return 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
+
+    @staticmethod
+    def compute_decision_weights_normal(outcomes: np.ndarray, gamma: float) -> np.ndarray:
+        """
+        Manuscript Eq. (4): Φ(x) = w(1 - F(x)) - w(1 - F(x + Δ)), where F is the
+        cumulative distribution function of a normal distribution fitted to the
+        remembered gross margins.
+
+        Implementation: outcomes are ranked; each outcome represents the interval
+        between the midpoints to its neighbouring outcomes (the lowest outcome extends
+        to -inf, the highest to +inf), so that Δ is the width of that interval and the
+        weights sum to one.
+        """
+        x = np.asarray(outcomes, dtype=float)
+        m = len(x)
+        if m == 1:
+            return np.ones(1)
+        mu = float(np.mean(x))
+        sd = float(np.std(x, ddof=1))
+        # Identical outcomes (no variation): all weight is equally shared
+        if not np.isfinite(sd) or sd <= 1e-9 * max(1.0, abs(mu)):
+            return np.full(m, 1.0 / m)
+
+        order = np.argsort(x)
+        xs = x[order]
+        mids = (xs[:-1] + xs[1:]) / 2.0
+        lower = np.concatenate(([-math.inf], mids))
+        upper = np.concatenate((mids, [math.inf]))
+
+        weights = np.zeros(m)
+        for k in range(m):
+            p_above_lower = 1.0 - CPTCalculator._normal_cdf(lower[k], mu, sd)
+            p_above_upper = 1.0 - CPTCalculator._normal_cdf(upper[k], mu, sd)
+            weights[order[k]] = (CPTCalculator.probability_weight(p_above_lower, gamma)
+                                 - CPTCalculator.probability_weight(p_above_upper, gamma))
+        return weights
+
     @staticmethod
     def compute_prospect_value(outcomes: np.ndarray, reference: float,
-                                alpha: float, beta: float, lambda_param: float,
-                                gamma_gain: float, gamma_loss: float) -> float:
-        """
-        Compute prospect value for a distribution of outcomes.
-        PV = Σ π_x * v(x - reference)
-        """
+                               alpha: float, beta: float, lambda_param: float,
+                               gamma_gain: float, gamma_loss: float,
+                               weights: Optional[np.ndarray] = None) -> float:
+        """PV = Σ Φ_x * v(x - reference). Weights can be supplied (Stage 1)."""
         deviations = outcomes - reference
-        weights = CPTCalculator.compute_decision_weights(deviations, gamma_gain, gamma_loss)
-        
+        if weights is None:
+            weights = CPTCalculator.compute_decision_weights(deviations, gamma_gain, gamma_loss)
         pv = 0.0
         for i, dev in enumerate(deviations):
-            v = CPTCalculator.value_function(dev, alpha, beta, lambda_param)
-            pv += weights[i] * v
-        
+            pv += weights[i] * CPTCalculator.value_function(dev, alpha, beta, lambda_param)
         return pv
-    
+
     @staticmethod
     def compute_certainty_equivalent(pv: float, alpha: float, beta: float, lambda_param: float) -> float:
-        """
-        Compute certainty equivalent from prospect value.
-        CE = PV^(1/α) if PV >= 0
-        CE = -(|PV|/λ)^(1/β) if PV < 0
-        """
+        """CE = PV^(1/α) if PV >= 0;  CE = -(|PV|/λ)^(1/β) if PV < 0"""
         if pv >= 0:
             return np.power(pv, 1 / alpha)
         else:
@@ -145,42 +193,38 @@ class VRNAAdoptionModel:
     Agent-Based Model for VRNA Technology Adoption.
     Implements the two-stage decision process based on FARMIND framework.
     """
-    
+
     def __init__(self, data_path: str, memory_horizon: int = 5, skip_stage1: bool = False,
-                 profit_max_stage2: bool = False):
-        """
-        Initialize the model with farmer data.
-        
-        Args:
-            data_path: Path to CSV file with farmer data
-            memory_horizon: Number of years for memory (default 5)
-            skip_stage1: If True, all agents are optimizers (skip satisfaction check)
-            profit_max_stage2: If True, use simple profit comparison in Stage 2 instead of CPT
-        """
+                 profit_max_stage2: bool = False, price_params: Optional[Dict] = None):
         self.memory_horizon = memory_horizon
         self.skip_stage1 = skip_stage1
         self.profit_max_stage2 = profit_max_stage2
         self.agents: List[FarmerAgent] = []
         self.cpt = CPTCalculator()
+
+        # CHANGE 1: price parameters
+        self.price = dict(DEFAULT_PRICE_PARAMS)
+        if price_params:
+            self.price.update(price_params)
+        missing = [k for k, v in self.price.items() if v is None]
+        if missing:
+            raise ValueError(f"Fill in the price parameters before running: {missing}")
+
+        self._stage2_cache: Dict = {}
         self.load_data(data_path)
-        
+
     def load_data(self, data_path: str):
         """Load farmer data from CSV and create agents."""
         df = pd.read_csv(data_path)
-        
-        # Remove farmers with NA Vref
         df = df[df['Vref'].notna() & (df['Vref'] != 'NA')]
         df['Vref'] = df['Vref'].astype(float)
-        
         print(f"Loaded {len(df)} farmers (excluded those with NA Vref)")
-        
+
         for _, row in df.iterrows():
-            # Extract GM_VRNA columns (1-60)
-            gm_vrna = np.array([row[f'GM_VRNA_{i}'] for i in range(1, 61)])
-            gm_baseline = np.array([row[f'GM_Baseline_{i}'] for i in range(1, 61)])
-            benefit = np.array([row[f'Benefit_{i}'] for i in range(1, 61)])
-            nred = np.array([row[f'Nred_{i}'] for i in range(1, 61)])
-            
+            gm_vrna = np.array([row[f'GM_VRNA_{i}'] for i in range(1, 61)], dtype=float)
+            gm_baseline = np.array([row[f'GM_Baseline_{i}'] for i in range(1, 61)], dtype=float)
+            benefit = np.array([row[f'Benefit_{i}'] for i in range(1, 61)], dtype=float)
+            nred = np.array([row[f'Nred_{i}'] for i in range(1, 61)], dtype=float)
             agent = FarmerAgent(
                 farmer_id=int(row['Farmer_ID']),
                 farm_size_ha=float(row['Farm_Size_ha']),
@@ -196,56 +240,65 @@ class VRNAAdoptionModel:
                 nred=nred
             )
             self.agents.append(agent)
-    
+
     def reset_agents(self):
         """Reset all agents to initial non-adopter state."""
         for agent in self.agents:
             agent.adopted = False
             agent.memory_gm = []
             agent.adoption_history = []
-    
+
+    # ------------------------------------------------------------------
+    # CHANGE 1: price changes relative to the base year
+    # ------------------------------------------------------------------
+    def price_changes(self, year: int) -> Tuple[float, float]:
+        """
+        Change in N price (CAD/kg) and operating cost (CAD/ha) in `year`
+        relative to the base year (year 1 = base year, no change).
+        """
+        k = year - 1
+        d_n_price = self.price["n_price_base"] * ((1 + self.price["n_price_growth"]) ** k - 1)
+        d_opcost = self.price["opcost_base"] * ((1 + self.price["opcost_growth"]) ** k - 1)
+        return d_n_price, d_opcost
+
+    def realized_gm(self, agent: FarmerAgent, state_idx: int, adopted: bool, year: int) -> float:
+        """Realised gross margin in `year` (without policy payment)."""
+        d_n_price, d_opcost = self.price_changes(year)
+        n_baseline = self.price["n_uniform_kg_ha"] * agent.farm_size_ha
+        if adopted:
+            gm = agent.gm_vrna[state_idx]
+            n_applied = n_baseline - agent.nred[state_idx]
+        else:
+            gm = agent.gm_baseline[state_idx]
+            n_applied = n_baseline
+        return gm - n_applied * d_n_price - agent.farm_size_ha * d_opcost
+
     def compute_policy_payment(self, agent: FarmerAgent, state_idx: int,
-                                policy_type: str, payment_level: float) -> float:
-        """
-        Compute policy payment for a given agent and state.
-        
-        Args:
-            agent: The farmer agent
-            state_idx: Index of the environment state (0-59)
-            policy_type: 'results_based', 'area_based', or 'flat'
-            payment_level: The payment rate
-            
-        Returns:
-            Policy payment amount
-        """
+                               policy_type: str, payment_level: float) -> float:
+        """Compute policy payment for a given agent and state. Unchanged."""
         if policy_type == 'results_based':
-            # CAD per kg of N saved
             return payment_level * agent.nred[state_idx]
         elif policy_type == 'area_based':
-            # CAD per hectare
             return payment_level * agent.farm_size_ha
         elif policy_type == 'flat':
-            # CAD per farm
             return payment_level
         else:
             raise ValueError(f"Unknown policy type: {policy_type}")
-    
+
     def stage1_strategy_selection(self, agent: FarmerAgent) -> str:
         """
-        Stage 1: Determine decision strategy (Repetition vs Optimization).
-        Based on satisfaction from past performance.
-        
-        Returns:
-            'repetition' if satisfied (PV > 0), 'optimization' if dissatisfied
+        Stage 1: Repetition vs Optimization, based on satisfaction with past
+        performance (manuscript Eqs. 1-5).
         """
         if len(agent.memory_gm) == 0:
-            # Use baseline GMs as historical distribution for year 1
+            # Year 1: baseline GMs across the 60 states serve as the history
             outcomes = agent.gm_baseline.copy()
         else:
-            # Use actual memory of past realized GMs
             outcomes = np.array(agent.memory_gm[-self.memory_horizon:])
-        
-        # Compute prospect value relative to reference income
+
+        # CHANGE 2: normal-distribution-based decision weights (Eq. 4)
+        weights = self.cpt.compute_decision_weights_normal(outcomes, agent.gamma_gain)
+
         pv = self.cpt.compute_prospect_value(
             outcomes=outcomes,
             reference=agent.vref,
@@ -253,369 +306,139 @@ class VRNAAdoptionModel:
             beta=agent.beta_val,
             lambda_param=agent.lambda_param,
             gamma_gain=agent.gamma_gain,
-            gamma_loss=agent.gamma_loss
+            gamma_loss=agent.gamma_loss,
+            weights=weights
         )
-        
-        return 'repetition' if pv > 0 else 'optimization'
-    
+        # CHANGE 3: satisfied if PV >= 0
+        return 'repetition' if pv >= 0 else 'optimization'
+
     def stage2_profit_max_decision(self, agent: FarmerAgent, state_idx: int,
-                                    policy_type: str, payment_level: float) -> bool:
+                                   policy_type: str, payment_level: float,
+                                   year: int = 1) -> bool:
         """
-        Stage 2 (Profit Maximizer): State-specific profit comparison (Huber et al. style).
-        
-        Adopt if: GM_VRNA(state) + payment > GM_baseline(state)
-        Equivalently: Δπ(state) + payment > 0
-        
-        This evaluates adoption for THIS specific scenario only,
-        allowing different farmers to adopt in different scenarios.
-        
-        Returns:
-            True if agent should adopt VRNA, False otherwise
+        Stage 2 (profit-maximisation benchmark): state-specific comparison.
+        UNCHANGED decision rule; N price of the current year is applied for
+        consistency with CHANGE 1.
         """
-        # Compute Δπ for THIS state only (not all 60)
-        base_benefit = agent.benefit[state_idx]  # GM_VRNA - GM_Baseline for this state
+        d_n_price, _ = self.price_changes(year)
+        base_benefit = agent.benefit[state_idx] + agent.nred[state_idx] * d_n_price
         policy_payment = self.compute_policy_payment(agent, state_idx, policy_type, payment_level)
-        delta_pi = base_benefit + policy_payment
-        
-        # Adopt if profit from VRNA > profit from baseline in THIS scenario
-        return delta_pi > 0
-    
-    def stage2_adoption_decision(self, agent: FarmerAgent, 
-                                  policy_type: str, payment_level: float) -> bool:
+        return base_benefit + policy_payment > 0
+
+    def stage2_adoption_decision(self, agent: FarmerAgent, policy_type: str,
+                                 payment_level: float, year: int = 1) -> bool:
         """
-        Stage 2: Evaluate VRNA adoption using CPT certainty equivalent.
-        
-        Returns:
-            True if agent should adopt VRNA, False otherwise
+        Stage 2: adopt if the CPT certainty equivalent of the incremental payoff
+        distribution across the 60 states (incl. payment) is positive.
+        CHANGE 1: incremental payoffs reflect the current year's N price
+        (VRNA saves N, so a higher N price raises its benefit).
+        The decision does not depend on the current state, so it is cached.
         """
-        # Compute Δπ for all 60 states including policy payment
+        key = (agent.farmer_id, policy_type, payment_level, year)
+        if key in self._stage2_cache:
+            return self._stage2_cache[key]
+
+        d_n_price, _ = self.price_changes(year)
         delta_pi = np.zeros(60)
         for s in range(60):
-            base_benefit = agent.benefit[s]  # GM_VRNA - GM_Baseline
+            base_benefit = agent.benefit[s] + agent.nred[s] * d_n_price
             policy_payment = self.compute_policy_payment(agent, s, policy_type, payment_level)
             delta_pi[s] = base_benefit + policy_payment
-        
-        # Compute prospect value with reference = 0 (no improvement)
+
         pv = self.cpt.compute_prospect_value(
-            outcomes=delta_pi,
-            reference=0.0,
-            alpha=agent.alpha,
-            beta=agent.beta_val,
-            lambda_param=agent.lambda_param,
-            gamma_gain=agent.gamma_gain,
-            gamma_loss=agent.gamma_loss
+            outcomes=delta_pi, reference=0.0,
+            alpha=agent.alpha, beta=agent.beta_val, lambda_param=agent.lambda_param,
+            gamma_gain=agent.gamma_gain, gamma_loss=agent.gamma_loss
         )
-        
-        # Compute certainty equivalent
         ce = self.cpt.compute_certainty_equivalent(
-            pv=pv,
-            alpha=agent.alpha,
-            beta=agent.beta_val,
-            lambda_param=agent.lambda_param
+            pv=pv, alpha=agent.alpha, beta=agent.beta_val, lambda_param=agent.lambda_param
         )
-        
-        # Adopt if CE > 0
-        return ce > 0
-    
-    def simulate_year(self, state_idx: int, policy_type: str, 
+        decision = ce > 0
+        self._stage2_cache[key] = decision
+        return decision
+
+    def simulate_year(self, state_idx: int, policy_type: str,
                       payment_level: float, year: int) -> Dict:
-        """
-        Simulate one year for all agents.
-        
-        Args:
-            state_idx: Environment state index (0-59)
-            policy_type: Type of policy instrument
-            payment_level: Payment level for the policy
-            year: Current simulation year (1-10)
-            
-        Returns:
-            Dictionary with year results
-        """
+        """Simulate one year for all agents."""
         adoptions = []
         n_reductions = []
-        
+
         for agent in self.agents:
             if self.skip_stage1:
-                # Skip Stage 1 - all agents are optimizers
                 strategy = 'optimization'
             else:
-                # Stage 1: Determine strategy based on satisfaction
                 strategy = self.stage1_strategy_selection(agent)
-            
+
             if strategy == 'repetition':
-                # Keep current adoption status (no change)
                 new_adoption = agent.adopted
             else:
-                # Stage 2: Optimization - Evaluate VRNA adoption
                 if self.profit_max_stage2:
-                    # State-specific profit comparison (Huber et al. style)
                     new_adoption = self.stage2_profit_max_decision(
-                        agent, state_idx, policy_type, payment_level
-                    )
+                        agent, state_idx, policy_type, payment_level, year)
                 else:
-                    # CPT-based CE decision (uses all 60 states)
                     new_adoption = self.stage2_adoption_decision(
-                        agent, policy_type, payment_level
-                    )
-            
-            # Update agent state
+                        agent, policy_type, payment_level, year)
+
             agent.adopted = new_adoption
             agent.adoption_history.append(1 if new_adoption else 0)
-            
-            # Determine realized GM for this year (raw, without policy payment for memory)
-            if new_adoption:
-                realized_gm = agent.gm_vrna[state_idx]
-                n_reduction = agent.nred[state_idx]
-            else:
-                realized_gm = agent.gm_baseline[state_idx]
-                n_reduction = 0.0
-            
-            # Update memory (raw GM without policy payment)
-            agent.memory_gm.append(realized_gm)
-            
+
+            # CHANGE 1: realised GM of the current year (without policy payment)
+            gm = self.realized_gm(agent, state_idx, new_adoption, year)
+            agent.memory_gm.append(gm)
+
             adoptions.append(1 if new_adoption else 0)
-            n_reductions.append(n_reduction)
-        
+            n_reductions.append(agent.nred[state_idx] if new_adoption else 0.0)
+
         return {
             'year': year,
             'adoption_rate': np.mean(adoptions),
             'total_n_reduction': np.sum(n_reductions),
             'adoptions': adoptions
         }
-    
+
     def simulate_state(self, state_idx: int, policy_type: str,
                        payment_level: float, n_years: int = 10) -> Dict:
-        """
-        Simulate 10 years for a single environment state.
-        
-        Returns:
-            Dictionary with simulation results
-        """
+        """Simulate 10 years for a single environment state."""
         self.reset_agents()
-        
         yearly_results = []
         for year in range(1, n_years + 1):
-            result = self.simulate_year(state_idx, policy_type, payment_level, year)
-            yearly_results.append(result)
-        
-        # Get final year adoption status and N reduction
+            yearly_results.append(self.simulate_year(state_idx, policy_type, payment_level, year))
+
         final_adoptions = [agent.adoption_history[-1] for agent in self.agents]
-        final_n_reduction = sum(
-            agent.nred[state_idx] if agent.adopted else 0 
-            for agent in self.agents
-        )
-        
+        final_n_reduction = sum(agent.nred[state_idx] if agent.adopted else 0
+                                for agent in self.agents)
+        final_ha_vrna = sum(agent.farm_size_ha if agent.adopted else 0
+                            for agent in self.agents)
         return {
             'state_idx': state_idx,
             'final_adoption_rate': np.mean(final_adoptions),
             'final_n_reduction': final_n_reduction,
+            'final_ha_vrna': final_ha_vrna,
+            'final_adopters': int(np.sum(final_adoptions)),
             'yearly_results': yearly_results,
             'adoption_histories': [agent.adoption_history.copy() for agent in self.agents]
         }
-    
+
     def simulate_payment_level(self, policy_type: str, payment_level: float,
-                                n_states: int = 60, n_years: int = 10) -> Dict:
-        """
-        Run full simulation for one payment level across all 60 states.
-        
-        Returns:
-            Dictionary with aggregated results
-        """
-        all_state_results = []
-        
-        for state_idx in range(n_states):
-            result = self.simulate_state(state_idx, policy_type, payment_level, n_years)
-            all_state_results.append(result)
-        
-        # Aggregate results across all states
-        # Average adoption rate across 60 states (final year)
-        avg_adoption_rate = np.mean([r['final_adoption_rate'] for r in all_state_results])
-        
-        # Expected N reduction (average across 60 states)
-        expected_n_reduction = np.mean([r['final_n_reduction'] for r in all_state_results])
-        
-        # Collect adoption histories per farmer (60 states × 10 years)
+                               n_states: int = 60, n_years: int = 10) -> Dict:
+        """Run full simulation for one payment level across all 60 states."""
+        all_state_results = [self.simulate_state(s, policy_type, payment_level, n_years)
+                             for s in range(n_states)]
+
         farmer_adoption_matrices = []
         for agent_idx in range(len(self.agents)):
-            # Matrix: 60 states × 10 years
             agent_matrix = np.zeros((n_states, n_years))
             for state_idx, result in enumerate(all_state_results):
                 agent_matrix[state_idx, :] = result['adoption_histories'][agent_idx]
             farmer_adoption_matrices.append(agent_matrix)
-        
+
         return {
             'policy_type': policy_type,
             'payment_level': payment_level,
-            'avg_adoption_rate': avg_adoption_rate,
-            'expected_n_reduction': expected_n_reduction,
+            'avg_adoption_rate': np.mean([r['final_adoption_rate'] for r in all_state_results]),
+            'expected_n_reduction': np.mean([r['final_n_reduction'] for r in all_state_results]),
+            'expected_ha_vrna': np.mean([r['final_ha_vrna'] for r in all_state_results]),
+            'expected_adopters': np.mean([r['final_adopters'] for r in all_state_results]),
             'state_results': all_state_results,
             'farmer_adoption_matrices': farmer_adoption_matrices
         }
-    
-    def run_policy_simulation(self, policy_type: str, 
-                               payment_increment: float,
-                               max_payment: float = None,
-                               convergence_threshold: float = 0.01,
-                               min_iterations: int = 5) -> List[Dict]:
-        """
-        Run simulation for a policy type, incrementing payment until convergence.
-        
-        Args:
-            policy_type: 'results_based', 'area_based', or 'flat'
-            payment_increment: Increment step for payment level
-            max_payment: Maximum payment level (optional safety limit)
-            convergence_threshold: Stop when marginal N reduction < this fraction
-            min_iterations: Minimum number of payment levels before checking convergence
-            
-        Returns:
-            List of results for each payment level
-        """
-        results = []
-        payment_level = 0.0
-        prev_n_reduction = 0.0
-        
-        # Set reasonable max limits if not specified
-        if max_payment is None:
-            if policy_type == 'results_based':
-                max_payment = 50.0  # CAD/kg
-            elif policy_type == 'area_based':
-                max_payment = 500.0  # CAD/ha
-            else:  # flat
-                max_payment = 50000.0  # CAD/farm
-        
-        iteration = 0
-        while payment_level <= max_payment:
-            print(f"  Payment level: {payment_level:.2f}")
-            
-            result = self.simulate_payment_level(policy_type, payment_level)
-            results.append(result)
-            
-            current_n_reduction = result['expected_n_reduction']
-            
-            # Check convergence (after minimum iterations and at least one non-zero result)
-            if iteration >= min_iterations and prev_n_reduction > 0:
-                marginal_increase = (current_n_reduction - prev_n_reduction) / prev_n_reduction
-                if marginal_increase < convergence_threshold:
-                    print(f"  Converged at payment level {payment_level:.2f} "
-                          f"(marginal increase: {marginal_increase:.4f})")
-                    break
-            
-            prev_n_reduction = current_n_reduction if current_n_reduction > 0 else prev_n_reduction
-            payment_level += payment_increment
-            iteration += 1
-        
-        return results
-
-
-def run_full_simulation(data_path: str, output_path: str):
-    """
-    Run the complete simulation for all three policy types.
-    
-    Args:
-        data_path: Path to input CSV file
-        output_path: Path for output CSV file
-    """
-    print("Initializing model...")
-    model = VRNAAdoptionModel(data_path)
-    
-    all_results = []
-    
-    # Policy configurations
-    policies = [
-        ('results_based', 0.5),   # CAD/kg, increment by 0.5
-        ('area_based', 5.0),      # CAD/ha, increment by 5
-        ('flat', 500.0)           # CAD/farm, increment by 500
-    ]
-    
-    for policy_type, increment in policies:
-        print(f"\nRunning simulation for {policy_type} policy...")
-        policy_results = model.run_policy_simulation(policy_type, increment)
-        
-        for result in policy_results:
-            all_results.append({
-                'policy_type': result['policy_type'],
-                'payment_level': result['payment_level'],
-                'avg_adoption_rate': result['avg_adoption_rate'],
-                'expected_n_reduction': result['expected_n_reduction']
-            })
-    
-    # Save summary results
-    summary_df = pd.DataFrame(all_results)
-    summary_path = output_path.replace('.csv', '_summary.csv')
-    summary_df.to_csv(summary_path, index=False)
-    print(f"\nSummary results saved to: {summary_path}")
-    
-    # Create detailed output with farmer-level adoption
-    print("\nGenerating detailed farmer-level output...")
-    generate_detailed_output(model, policies, output_path)
-    
-    return model, all_results
-
-
-def generate_detailed_output(model: VRNAAdoptionModel, policies: List[Tuple], output_path: str):
-    """
-    Generate detailed CSV output with adoption status for each farmer.
-    
-    Output format:
-    Farmer_ID | Policy | Payment_Level | Year_1 | Year_2 | ... | Year_10 | Avg_Nred
-    """
-    rows = []
-    
-    for policy_type, increment in policies:
-        print(f"  Processing {policy_type}...")
-        payment_level = 0.0
-        prev_n_reduction = 0.0
-        
-        # Determine max payment
-        if policy_type == 'results_based':
-            max_payment = 50.0
-        elif policy_type == 'area_based':
-            max_payment = 500.0
-        else:
-            max_payment = 50000.0
-        
-        while payment_level <= max_payment:
-            result = model.simulate_payment_level(policy_type, payment_level)
-            
-            # For each farmer, get their adoption history across all states
-            for agent_idx, agent in enumerate(model.agents):
-                # Average adoption across 60 states for each year
-                adoption_matrix = result['farmer_adoption_matrices'][agent_idx]
-                avg_adoptions_per_year = adoption_matrix.mean(axis=0)  # Average across states
-                
-                # Average N reduction if adopted
-                avg_nred = 0.0
-                for state_idx in range(60):
-                    if adoption_matrix[state_idx, -1] == 1:  # Adopted in final year
-                        avg_nred += agent.nred[state_idx]
-                avg_nred /= 60  # Average across states
-                
-                row = {
-                    'Farmer_ID': agent.farmer_id,
-                    'Policy': policy_type,
-                    'Payment_Level': payment_level
-                }
-                for year in range(10):
-                    row[f'Year_{year + 1}'] = avg_adoptions_per_year[year]
-                row['Avg_Nred'] = avg_nred
-                
-                rows.append(row)
-            
-            # Check convergence
-            current_n_reduction = result['expected_n_reduction']
-            if prev_n_reduction > 0:
-                marginal_increase = (current_n_reduction - prev_n_reduction) / prev_n_reduction
-                if marginal_increase < 0.01:
-                    break
-            
-            prev_n_reduction = current_n_reduction if current_n_reduction > 0 else prev_n_reduction
-            payment_level += increment
-    
-    df = pd.DataFrame(rows)
-    df.to_csv(output_path, index=False)
-    print(f"Detailed results saved to: {output_path}")
-
-
-if __name__ == "__main__":
-    # This will be called from run.py
-    pass
